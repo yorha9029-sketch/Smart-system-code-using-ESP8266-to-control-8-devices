@@ -1,0 +1,697 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h> 
+#include <WiFiClientSecure.h> 
+#include <UniversalTelegramBot.h> 
+#include <ArduinoJson.h> 
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+#include <ESP8266mDNS.h>
+#include <Ticker.h>
+
+#define BOT_TOKEN "YOUR_TELEGRAM_BOT_TOKEN"  
+#define CHAT_ID "YOUR_CHAT_ID"   
+
+ESP8266WiFiMulti wifiMulti;
+Ticker ledTicker;
+
+void setupWiFi() {
+  wifiMulti.addAP("WIFI1", "PASS"); 
+  wifiMulti.addAP("WIFI2", "PASS"); 
+  wifiMulti.addAP("WIFI3", "PASS");
+}
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+unsigned long bot_lasttime = 0; 
+const unsigned long BOT_MTBS = 3000; 
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+ESP8266WebServer server(80);
+
+int ledPins[] = {0, 2, 14, 12, 13, 15, 3, 1};
+volatile int currentMode = 0;
+unsigned long lastUpdate = 0;
+unsigned long lastClockUpdate = 0;
+volatile int step = 0;
+volatile int dir = 1;
+volatile int heartDelay = 100;
+volatile float speedMult = 1.0;
+volatile int pwmVal = 0;
+volatile int pwmDir = 1;
+
+volatile int meteorTail[8] = {0}; 
+volatile int beatPos = 8; 
+
+volatile int globalBrightness = 1023;
+volatile bool manualState[8] = {false, false, false, false, false, false, false, false};
+int displayState = 0;
+String currentLocation = "Ho Chi Minh";
+int subMode = 2; 
+unsigned long lastModeChange = 0;
+
+String modeNames[] = {
+  "TAT HET", "SANG HET", "CHOP TAT", "LED DUOI", "XEN KE", "RANDOM",
+  "QUA LAI", "NHIP TIM", "CHINH TAY", "SANG DON", "NHIP THO", "CHOP LOA",
+  "CANH SAT", "QUET RADAR", "HOI TU", "PHAN TAN", "NHAY FLASH CLUB",
+  "LUA BAP BUNG", "SONG LUON", "SAO CHOI", "CHOP DJ", "TIN HIEU SOS",
+  "TIA SET", "PING PONG", "AUTO MIX", 
+  "MA TRAN", "CAU VONG", "SAO BANG"
+};
+
+void changeMode(int m) {
+  displayState = 0; 
+  for(int i=0; i<8; i++) { analogWrite(ledPins[i], 0); meteorTail[i] = 0; }
+  beatPos = 8;
+  currentMode = m;
+  step = 0; dir = 1; pwmVal = 0; pwmDir = 1; 
+  updateOLED();
+  lastModeChange = millis();
+}
+
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = bot.messages[i].chat_id;
+    if (chat_id != CHAT_ID) {
+      bot.sendMessage(chat_id, "Tu choi", "");
+      continue;
+    }
+    
+    String text = bot.messages[i].text;
+    text.toLowerCase();
+    
+    String from_name = bot.messages[i].from_name;
+    if (from_name == "") from_name = "Sep";
+
+    bool hasNum = false;
+    for(int n=1; n<=8; n++) { if(text.indexOf(String(n)) > -1) hasNum = true; }
+
+    if (text == "/start") {
+      bot.sendMessage(chat_id, "San sang", "Markdown");
+    }
+    else if (text.indexOf("chẵn") > -1) {
+      changeMode(8);
+      for(int j=0; j<8; j++) manualState[j] = (j % 2 != 0);
+      bot.sendMessage(chat_id, "Bat chan", "");
+    }
+    else if (text.indexOf("lẻ") > -1) {
+      changeMode(8);
+      for(int j=0; j<8; j++) manualState[j] = (j % 2 == 0);
+      bot.sendMessage(chat_id, "Bat le", "");
+    }
+    else if (text.indexOf("tắt") > -1 && hasNum) {
+      changeMode(8);
+      String msg = "Da tat: ";
+      for(int j=0; j<8; j++) {
+        if (text.indexOf(String(j+1)) > -1) { manualState[j] = false; msg += String(j+1) + " "; }
+      }
+      bot.sendMessage(chat_id, msg, "");
+    }
+    else if ((text.indexOf("bật") > -1 || text.indexOf("mở") > -1 || text.indexOf("sáng") > -1) && hasNum) {
+      changeMode(8);
+      String msg = "Da bat: ";
+      for(int j=0; j<8; j++) {
+        if (text.indexOf(String(j+1)) > -1) { manualState[j] = true; msg += String(j+1) + " "; }
+      }
+      bot.sendMessage(chat_id, msg, "");
+    }
+    else if (text.indexOf("nhạc") > -1 || text.indexOf("quẩy") > -1) { changeMode(16); bot.sendMessage(chat_id, "Nhac", ""); }
+    else if (text.indexOf("auto") > -1 || text.indexOf("tự động") > -1) { changeMode(24); bot.sendMessage(chat_id, "Auto", ""); }
+    else if (text.indexOf("cầu vồng") > -1) { changeMode(26); bot.sendMessage(chat_id, "Cau vong", ""); }
+    else if (text.indexOf("ma trận") > -1) { changeMode(25); bot.sendMessage(chat_id, "Ma tran", ""); }
+    else if (text.indexOf("sao băng") > -1) { changeMode(27); bot.sendMessage(chat_id, "Sao bang", ""); }
+    else if (text.indexOf("đuổi") > -1) { changeMode(3); bot.sendMessage(chat_id, "Duoi", ""); }
+    else if (text.indexOf("sóng") > -1) { changeMode(18); bot.sendMessage(chat_id, "Song", ""); }
+    else if (text.indexOf("tắt hết") > -1 || text == "tắt" || text == "/off") { changeMode(0); bot.sendMessage(chat_id, "Da tat", ""); }
+    else if (text.indexOf("sáng hết") > -1 || text.indexOf("bật hết") > -1 || text == "bật" || text == "mở" || text == "/on") { changeMode(1); bot.sendMessage(chat_id, "Da bat", ""); }
+  }
+}
+
+void fetchLocation() {
+  WiFiClient client;
+  HTTPClient http;
+  if (http.begin(client, "http://ip-api.com/line/?fields=city")) {
+    if (http.GET() == HTTP_CODE_OK) {
+      currentLocation = http.getString();
+      currentLocation.trim(); currentLocation.toUpperCase();
+    }
+    http.end();
+  }
+}
+
+void updateOLED() {
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  if (displayState == 1) {
+    time_t now = time(nullptr); struct tm* p_tm = localtime(&now);
+    char timeStr[10]; sprintf(timeStr, "%02d:%02d:%02d", p_tm->tm_hour, p_tm->tm_min, p_tm->tm_sec);
+    display.setTextSize(1); display.setCursor(0, 0); display.println("THOI GIAN THUC:");
+    display.setTextSize(2); display.setCursor(0, 16); display.println(timeStr);
+  } else if (displayState == 2) {
+    time_t now = time(nullptr); struct tm* p_tm = localtime(&now);
+    char dateStr[15]; sprintf(dateStr, "%02d/%02d/%04d", p_tm->tm_mday, p_tm->tm_mon + 1, p_tm->tm_year + 1900);
+    display.setTextSize(1); display.setCursor(0, 0); display.println("VITRI: " + currentLocation);
+    display.setTextSize(2); display.setCursor(0, 16); display.println(dateStr);
+  } else {
+    display.setTextSize(1); display.setCursor(0, 0); display.println("CHE DO HIEN TAI:");
+    display.setTextSize(2); display.setCursor(0, 16); display.println(modeNames[currentMode]);
+  }
+  display.display();
+}
+
+void resetLEDs() {
+  for(int i=0; i<8; i++) { analogWrite(ledPins[i], 0); meteorTail[i] = 0; }
+  beatPos = 8; 
+}
+
+void updateLEDs() {
+  unsigned long now = millis();
+  switch(currentMode) {
+    case 0: for(int i=0; i<8; i++) analogWrite(ledPins[i], 0); break;
+    case 1: for(int i=0; i<8; i++) analogWrite(ledPins[i], globalBrightness); break;
+    case 2:
+      if (now - lastUpdate > (300 * speedMult)) { lastUpdate = now; step = !step;
+      for(int i=0; i<8; i++) analogWrite(ledPins[i], step ? globalBrightness : 0); } break;
+    case 3:
+      if (now - lastUpdate > (100 * speedMult)) { lastUpdate = now; resetLEDs(); analogWrite(ledPins[step], globalBrightness);
+      step = (step + 1) % 8; } break;
+    case 4:
+      if (now - lastUpdate > (300 * speedMult)) { lastUpdate = now; step = !step;
+      for(int i=0; i<8; i++) analogWrite(ledPins[i], ((i%2 == 0) ? step : !step) ? globalBrightness : 0); } break;
+    case 5:
+      if (now - lastUpdate > (150 * speedMult)) { lastUpdate = now; analogWrite(ledPins[random(0,8)], random(0,2) ? globalBrightness : 0); } break;
+    case 6:
+      if (now - lastUpdate > (100 * speedMult)) { lastUpdate = now; resetLEDs(); analogWrite(ledPins[step], globalBrightness); step += dir;
+      if (step >= 7 || step <= 0) dir = -dir; } break;
+    case 7:
+      if (now - lastUpdate > (heartDelay * speedMult)) {
+        lastUpdate = now; step++;
+        if (step == 1) { for(int i=0; i<8; i++) analogWrite(ledPins[i], globalBrightness); heartDelay = 100;
+        } else if (step == 2) { resetLEDs(); heartDelay = 150;
+        } else if (step == 3) { for(int i=0; i<8; i++) analogWrite(ledPins[i], globalBrightness); heartDelay = 100; } else { resetLEDs();
+        heartDelay = 800; step = 0; }
+      } break;
+    case 8:
+      for(int i=0; i<8; i++) analogWrite(ledPins[i], manualState[i] ? globalBrightness : 0);
+      break;
+    case 9:
+      if (now - lastUpdate > (150 * speedMult)) { lastUpdate = now; if (step == 0) resetLEDs(); analogWrite(ledPins[step], globalBrightness); step++;
+      if (step > 8) step = 0; } break;
+    case 10:
+      if (now - lastUpdate > (15 * speedMult)) {
+        lastUpdate = now; pwmVal += (20 * pwmDir); if (pwmVal >= 1023) { pwmVal = 1023; pwmDir = -1;
+        } if (pwmVal <= 0) { pwmVal = 0; pwmDir = 1; }
+        int currentBreathe = map(pwmVal, 0, 1023, 0, globalBrightness);
+        for(int i=0; i<8; i++) analogWrite(ledPins[i], currentBreathe);
+      } break;
+    case 11:
+      if (now - lastUpdate > (40 * speedMult)) { lastUpdate = now; step = !step;
+      for(int i=0; i<8; i++) analogWrite(ledPins[i], step ? globalBrightness : 0); } break;
+    case 12:
+      if (now - lastUpdate > (60 * speedMult)) {
+        lastUpdate = now; step++;
+        if(step <= 6) { for(int i=0;i<4;i++) analogWrite(ledPins[i], (step%2) ? globalBrightness : 0); for(int i=4;i<8;i++) analogWrite(ledPins[i], 0); }
+        else if(step <= 12) { for(int i=0;i<4;i++) analogWrite(ledPins[i], 0); for(int i=4;i<8;i++) analogWrite(ledPins[i], (step%2) ? globalBrightness : 0); }
+        else { step = 0; }
+      } break;
+    case 13:
+      if (now - lastUpdate > (40 * speedMult)) {
+        lastUpdate = now; step++;
+        resetLEDs(); analogWrite(ledPins[step%8], globalBrightness);
+      } break;
+    case 14:
+      if (now - lastUpdate > (120 * speedMult)) {
+        lastUpdate = now; resetLEDs();
+        analogWrite(ledPins[step], globalBrightness); analogWrite(ledPins[7-step], globalBrightness);
+        step++; if (step > 3) step = 0;
+      } break;
+    case 15:
+      if (now - lastUpdate > (120 * speedMult)) {
+        lastUpdate = now; resetLEDs();
+        analogWrite(ledPins[3-step], globalBrightness); analogWrite(ledPins[4+step], globalBrightness);
+        step++; if (step > 3) step = 0;
+      } break;
+    case 16:
+      if (now - lastUpdate > 20) { 
+        lastUpdate = now;
+        for(int i = 0; i < 8; i++) {
+           meteorTail[i] = meteorTail[i] > 100 ? meteorTail[i] - 100 : 0; 
+           analogWrite(ledPins[i], meteorTail[i]);
+        }
+        if (beatPos == 0) {
+           for(int i = 0; i < 8; i++) {
+               if (random(0, 10) > 3) { 
+                   meteorTail[i] = globalBrightness;
+               } else {
+                   meteorTail[i] = 0;
+               }
+           }
+           beatPos = 8; 
+        }
+      }
+      break;
+    case 17:
+      if (now - lastUpdate > (50 * speedMult)) {
+        lastUpdate = now;
+        for(int i = 0; i < 8; i++) analogWrite(ledPins[i], random(globalBrightness / 10, globalBrightness));
+      } break;
+    case 18:
+      for(int i = 0; i < 8; i++) {
+        float wave = (sin((now / (200.0 * speedMult)) + (i * 0.8)) + 1.0) / 2.0;
+        analogWrite(ledPins[i], wave * globalBrightness);
+      } break;
+    case 19:
+      if (now - lastUpdate > (80 * speedMult)) {
+        lastUpdate = now; resetLEDs();
+        int pos = step % 8;
+        analogWrite(ledPins[pos], globalBrightness);
+        if(pos > 0) analogWrite(ledPins[pos-1], globalBrightness / 2);
+        if(pos > 1) analogWrite(ledPins[pos-2], globalBrightness / 5);
+        step++;
+      } break;
+    case 20:
+      if (now - lastUpdate > (60 * speedMult)) {
+        lastUpdate = now; resetLEDs();
+        analogWrite(ledPins[random(0, 8)], globalBrightness);
+      } break;
+    case 21:
+      if (now - lastUpdate > (200 * speedMult)) {
+        lastUpdate = now;
+        int pattern[] = {1,0,1,0,1,0, 1,1,0,1,1,0,1,1,0, 1,0,1,0,1,0, 0,0,0,0};
+        int state = pattern[step % 25];
+        for(int i = 0; i < 8; i++) analogWrite(ledPins[i], state ? globalBrightness : 0);
+        step++;
+      } break;
+    case 22:
+      if (now - lastUpdate > (heartDelay * speedMult)) {
+        lastUpdate = now;
+        if (step == 0) {
+          for(int i=0; i<8; i++) analogWrite(ledPins[i], random(0, 10) > 7 ? globalBrightness : 0);
+          heartDelay = random(20, 50); step = 1;
+        } else if (step == 1) {
+          resetLEDs(); heartDelay = random(30, 80); step = 2;
+        } else if (step == 2) {
+          for(int i=0; i<8; i++) analogWrite(ledPins[i], random(0, 10) > 6 ? globalBrightness : 0);
+          heartDelay = random(20, 50); step = 3;
+        } else {
+          resetLEDs(); heartDelay = random(800, 3000); step = 0;
+        }
+      }
+      break;
+    case 23:
+      if (now - lastUpdate > (70 * speedMult)) {
+        lastUpdate = now; resetLEDs();
+        analogWrite(ledPins[step], globalBrightness);
+        if (dir == 1) {
+          if(step > 0) analogWrite(ledPins[step-1], globalBrightness / 2);
+          if(step > 1) analogWrite(ledPins[step-2], globalBrightness / 6);
+        } else {
+          if(step < 7) analogWrite(ledPins[step+1], globalBrightness / 2);
+          if(step < 6) analogWrite(ledPins[step+2], globalBrightness / 6);
+        }
+        step += dir;
+        if (step >= 7) { step = 7; dir = -1;
+        } else if (step <= 0) { step = 0; dir = 1; }
+      }
+      break;
+    case 24:
+      if (now - lastModeChange > 8000) {
+        lastModeChange = now;
+        int oldMode = subMode;
+        do { subMode = random(2, 28); } while (subMode == oldMode || subMode == 8 || subMode == 16);
+        resetLEDs(); step = 0; dir = 1; pwmVal = 0; pwmDir = 1;
+      }
+      currentMode = subMode; updateLEDs(); currentMode = 24;
+      break;
+    case 25: 
+      if (now - lastUpdate > (40 * speedMult)) { 
+        lastUpdate = now; 
+        for(int i=0; i<8; i++) {
+           if(random(0, 10) > 8) meteorTail[i] = globalBrightness; 
+           else meteorTail[i] = meteorTail[i] > 40 ? meteorTail[i] - 40 : 0; 
+           analogWrite(ledPins[i], meteorTail[i]);
+        }
+      } break;
+    case 26: 
+      for(int i = 0; i < 8; i++) { 
+        float wave = (sin((now / (400.0 * speedMult)) + (i * 0.4)) + 1.0) / 2.0; 
+        analogWrite(ledPins[i], wave * globalBrightness); 
+      } break;
+    case 27: 
+      if (now - lastUpdate > (60 * speedMult)) {
+        lastUpdate = now;
+        for(int i=0; i<8; i++) { meteorTail[i] = meteorTail[i] > 60 ? meteorTail[i] - 60 : 0; }
+        meteorTail[step] = globalBrightness; 
+        for(int i=0; i<8; i++) analogWrite(ledPins[i], meteorTail[i]);
+        step++; if(step > 9) step = 0; 
+      } break;
+  }
+}
+
+const char webpage[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart 8-LED AI Hub</title>
+<style>
+  body { font-family: Arial, sans-serif; text-align: center; background: #1e1e24; color: #fff; padding: 10px;}
+  .mic-btn { width: 100%; max-width: 320px; background: #ff4757; font-size: 16px; font-weight: bold; padding: 15px; border-radius: 8px; margin: 10px auto; border: none; color: white; box-shadow: 0 4px 6px rgba(0,0,0,0.3); cursor: pointer; text-transform: uppercase;}
+  .mic-btn.listening { background: #2ed573; color: #000; box-shadow: 0 0 15px #2ed573; transform: scale(1.05);}
+  .btn-row { display: flex; justify-content: space-between; max-width: 320px; margin: 10px auto; }
+  .btn-row button { width: 48%; font-size: 13px; font-weight: bold; padding: 12px; border-radius: 8px; border: none; color: white; cursor: pointer;}
+  #status { font-size: 14px; color: #ffa502; margin-bottom: 10px; font-weight: bold;}
+  .section-title { margin: 15px 0 10px; font-size: 13px; border-bottom: 2px solid #57606f; padding-bottom: 5px; color: #ced6e0; text-transform: uppercase; font-weight: bold;}
+  .btn-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; max-width: 400px; margin: 0 auto;}
+  .btn-grid button { padding: 12px; border-radius: 6px; border: none; background: #2f3542; color: white; font-size: 13px; border: 1px solid #57606f; font-weight: bold; cursor: pointer; transition: 0.2s;}
+  .btn-grid button:active { background: #57606f;}
+  .btn-led-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; max-width: 400px; margin: 0 auto;}
+  .btn-led { padding: 15px 0; border-radius: 6px; border: 1px solid #747d8c; background: #1e272e; color: white; font-weight: bold; font-size: 14px; cursor: pointer;}
+  .btn-led.active { background: #eccc68; border-color: #eccc68; color: #000; box-shadow: 0 0 10px #eccc68;}
+  .slider-container { margin: 10px auto; max-width: 400px; background: #2f3542; padding: 15px; border-radius: 8px; border: 1px solid #57606f;}
+  input[type=range] { width: 100%; margin-top: 10px; }
+  .lbl-row { display: flex; justify-content: space-between; font-size: 12px; font-weight: bold; color: #ced6e0;}
+</style>
+</head>
+<body>
+  <h2 style="margin:5px 0; color:#70a1ff;">TRUNG TÂM ĐIỀU KHIỂN AI</h2>
+  <button class="mic-btn" id="micBtn" onclick="startDictation()"> 🎤 BẤM ĐỂ NÓI LỆNH</button>
+  <p id="status">Sẵn sàng nghe...</p>
+  <div class="btn-row">
+    <button style="background:#3742fa;" onclick="showOLEDMode(1)"> 🕒 XEM GIỜ</button>
+    <button style="background:#1e90ff;" onclick="showOLEDMode(2)"> 📍 ĐỊA ĐIỂM</button>
+  </div>
+  <div class="slider-container">
+    <div class="lbl-row"><span>TỐC ĐỘ</span> <span id="speedLabel" style="color:#7bed9f;">100%</span></div>
+    <input type="range" min="10" max="300" value="100" id="speedSlider" onchange="changeSpeed(this.value)">
+  </div>
+  <div class="slider-container">
+    <div class="lbl-row"><span>ĐỘ SÁNG</span> <span id="brightLabel" style="color:#eccc68;">100%</span></div>
+    <input type="range" min="1" max="100" value="100" id="brightSlider" onchange="changeBright(this.value)">
+  </div>
+  <div class="section-title">CHỈNH TAY 8 BÓNG ĐỘC LẬP</div>
+  <div class="btn-led-grid" style="margin-bottom: 8px;">
+    <button class="btn-led" id="led0" onclick="toggleLed(0)">1</button> <button class="btn-led" id="led1" onclick="toggleLed(1)">2</button>
+    <button class="btn-led" id="led2" onclick="toggleLed(2)">3</button> <button class="btn-led" id="led3" onclick="toggleLed(3)">4</button>
+  </div>
+  <div class="btn-led-grid">
+    <button class="btn-led" id="led4" onclick="toggleLed(4)">5</button> <button class="btn-led" id="led5" onclick="toggleLed(5)">6</button>
+    <button class="btn-led" id="led6" onclick="toggleLed(6)">7</button> <button class="btn-led" id="led7" onclick="toggleLed(7)">8</button>
+  </div>
+  <div class="section-title">28 HIỆU ỨNG TỰ ĐỘNG</div>
+  <div class="btn-grid">
+    <button onclick="sendMode(24)" style="background:#ff7f50; color:white; grid-column: span 2; font-size:14px;"> 🔀 AUTO MIX (TỰ CHUYỂN)</button>
+    <button onclick="sendMode(0)" style="background:#ff4757;">Tắt hết</button>
+    <button onclick="sendMode(1)" style="background:#2ed573; color:#000;">Sáng hết</button>
+    <button onclick="sendMode(16)" style="background:#1e90ff; grid-column: span 2; font-size:14px; box-shadow: 0 0 10px #1e90ff;"> 🎵 QUẨY FLASH CLUB</button>
+    <button onclick="sendMode(25)" style="color:#2ed573;">💻 Ma Trận</button> <button onclick="sendMode(26)" style="color:#ff7f50;">🌈 Cầu Vồng</button>
+    <button onclick="sendMode(27)" style="color:#eccc68;">🌠 Sao Băng</button> <button onclick="sendMode(2)">Chớp tắt</button>
+    <button onclick="sendMode(3)">LED Đuổi</button> <button onclick="sendMode(4)">Xen kẽ</button>
+    <button onclick="sendMode(5)">Random</button>   <button onclick="sendMode(6)">Qua lại</button>
+    <button onclick="sendMode(7)">Nhịp tim</button> <button onclick="sendMode(9)">Sáng dồn</button>
+    <button onclick="sendMode(10)">Nhịp thở</button><button onclick="sendMode(11)">Chớp lóa</button>
+    <button onclick="sendMode(12)">Cảnh sát</button><button onclick="sendMode(13)">Quét Radar</button>
+    <button onclick="sendMode(14)">Hội tụ (Vào)</button> <button onclick="sendMode(15)">Phân tán (Ra)</button>
+    <button onclick="sendMode(17)">Lửa bập bùng</button><button onclick="sendMode(18)">Sóng lượn</button>
+    <button onclick="sendMode(19)">Sao chổi</button><button onclick="sendMode(20)">Chớp DJ</button>
+    <button onclick="sendMode(21)">Tín hiệu SOS</button><button onclick="sendMode(22)"> ⚡ Tia Sét</button>
+    <button onclick="sendMode(23)" style="grid-column: span 2;"> 🏓 Ping Pong</button>
+  </div>
+<script>
+let audioContext, analyser, microphone, scriptNode;
+let isMusicSyncing = false;
+let lastBeat = 0;
+
+function sendMode(m) {
+  fetch('/set?m=' + m);
+  document.getElementById('status').innerText = "Đã chuyển hiệu ứng!";
+  for(let i=0; i<8; i++) document.getElementById('led'+i).classList.remove('active');
+  if(m == 16) startMusicSync();
+  else isMusicSyncing = false;
+}
+function showOLEDMode(state) { fetch('/set_display?s=' + state); }
+function toggleLed(id) {
+  fetch('/set_led?id=' + id).then(r=>r.text()).then(state => {
+    let btn = document.getElementById('led'+id);
+    if(state === "1") btn.classList.add('active'); else btn.classList.remove('active');
+  });
+}
+function changeSpeed(val) { fetch('/set_speed?v=' + val); document.getElementById('speedLabel').innerText = val + '%'; }
+function changeBright(val) { fetch('/set_bright?v=' + val); document.getElementById('brightLabel').innerText = val + '%'; }
+
+function startMusicSync() {
+  if(audioContext) { isMusicSyncing = true; return; }
+  navigator.mediaDevices.getUserMedia({audio: true}).then(stream => {
+    isMusicSyncing = true;
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = audioContext.createAnalyser();
+    microphone = audioContext.createMediaStreamSource(stream);
+    scriptNode = audioContext.createScriptProcessor(256, 1, 1);
+    analyser.smoothingTimeConstant = 0.2; 
+    analyser.fftSize = 256;
+    microphone.connect(analyser); analyser.connect(scriptNode); scriptNode.connect(audioContext.destination);
+
+    scriptNode.onaudioprocess = function() {
+      if(!isMusicSyncing) return;
+      let array = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(array);
+      let bassSum = 0;
+      for(let i=0; i<4; i++) bassSum += array[i]; 
+      let bassAvg = bassSum / 4;
+      let boostedAverage = bassAvg * 2.0;
+      if(boostedAverage > 160 && Date.now() - lastBeat > 150) {
+        lastBeat = Date.now();
+        fetch('/beat').catch(e=>{});
+      }
+    }
+  }).catch(e => { alert("Loi Micro"); });
+}
+
+function startDictation() {
+  if (window.hasOwnProperty('webkitSpeechRecognition') || window.hasOwnProperty('SpeechRecognition')) {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.lang = "vi-VN"; recognition.continuous = false;
+
+    const btn = document.getElementById('micBtn');
+    btn.classList.add('listening'); btn.innerText = "ĐANG NGHE...";
+    recognition.start();
+    
+    recognition.onresult = function(e) {
+      btn.classList.remove('listening'); btn.innerText = " 🎤 BẤM ĐỂ NÓI LỆNH";
+      let text = e.results[0][0].transcript.toLowerCase();
+      document.getElementById('status').innerText = "Bạn nói: '" + text + "'";
+
+      if(text.includes('giờ') || text.includes('đồng hồ')) { showOLEDMode(1); return; }
+      if(text.includes('ngày') || text.includes('địa chỉ') || text.includes('ở đâu')) { showOLEDMode(2); return; }
+      
+      let brightMatch = text.match(/(?:độ sáng|sáng).*?(\d+)/);
+      if(brightMatch && !text.includes('led') && !text.includes('bóng') && !text.includes('số')) { 
+        let b = parseInt(brightMatch[1]); 
+        if(b < 1) b = 1; if(b > 100) b = 100; 
+        changeBright(b); 
+        return; 
+      }
+      if(text.includes('sáng hơn') || text.includes('tăng sáng') || text.includes('tăng độ sáng')) { 
+        let slider = document.getElementById('brightSlider');
+        let b = parseInt(slider.value) + 20; if(b > 100) b = 100; 
+        changeBright(b); return; 
+      }
+      if(text.includes('tối đi') || text.includes('giảm sáng') || text.includes('tối lại')) { 
+        let slider = document.getElementById('brightSlider');
+        let b = parseInt(slider.value) - 20; if(b < 10) b = 10; 
+        changeBright(b); return; 
+      }
+      
+      let speedMatch = text.match(/(?:tốc độ|tốc do|nhanh).*?(\d+)/);
+      if(speedMatch) { 
+        let s = parseInt(speedMatch[1]); 
+        if(s < 10) s = 10; if(s > 300) s = 300; 
+        changeSpeed(s); return; 
+      }
+      if(text.includes('nhanh') || text.includes('tăng tốc')) { 
+        let slider = document.getElementById('speedSlider');
+        let s = parseInt(slider.value) + 50; if(s > 300) s = 300; 
+        changeSpeed(s); return; 
+      }
+      if(text.includes('chậm') || text.includes('giảm tốc')) { 
+        let slider = document.getElementById('speedSlider');
+        let s = parseInt(slider.value) - 50; if(s < 10) s = 10; 
+        changeSpeed(s); return; 
+      }
+
+      text = text.replace(/một/g, '1').replace(/hai/g, '2').replace(/ba/g, '3').replace(/bốn/g, '4')
+                 .replace(/năm/g, '5').replace(/sáu/g, '6').replace(/bảy/g, '7').replace(/tám/g, '8');
+
+      let manualAction = text.match(/(bật|mở|tắt).*(đèn|led|bóng)?/);
+      if(manualAction && !text.includes('nhạc') && !text.includes('chớp') && !text.includes('đuổi') && !text.includes('hết')) {
+          let action = manualAction[1];
+          let val = (action === 'tắt') ? 0 : 1;
+          let targetIds = [];
+          
+          if (text.includes('chẵn')) { targetIds = [1, 3, 5, 7]; } 
+          else if (text.includes('lẻ')) { targetIds = [0, 2, 4, 6]; } 
+          else {
+              for(let i=1; i<=8; i++) {
+                  if(text.includes(i.toString())) targetIds.push(i - 1);
+              }
+          }
+          
+          if(targetIds.length > 0) {
+              (async function() {
+                  for(let id of targetIds) {
+                      await fetch('/set_led?id=' + id + '&val=' + val);
+                      let btn = document.getElementById('led'+id);
+                      if(val) btn.classList.add('active'); else btn.classList.remove('active');
+                  }
+              })();
+              return;
+          }
+      }
+      
+      if(text.includes('ma trận') || text.includes('hacker')) sendMode(25);
+      else if(text.includes('cầu vồng') || text.includes('cực quang')) sendMode(26);
+      else if(text.includes('sao băng') || text.includes('mưa sao')) sendMode(27);
+      else if(text.includes('mix') || text.includes('tự động')) sendMode(24);
+      else if(text.includes('nhạc') || text.includes('quẩy') || text.includes('eq')) sendMode(16);
+      else if(text.includes('lửa') || text.includes('bập bùng')) sendMode(17);
+      else if(text.includes('sóng') || text.includes('lượn')) sendMode(18);
+      else if(text.includes('sao') || text.includes('chổi')) sendMode(19);
+      else if(text.includes('dj') || text.includes('club')) sendMode(20);
+      else if(text.includes('sos') || text.includes('cấp cứu')) sendMode(21);
+      else if(text.includes('sét') || text.includes('sấm')) sendMode(22);
+      else if(text.includes('ping') || text.includes('lắc')) sendMode(23);
+      else if(text.includes('hội tụ')) sendMode(14);
+      else if(text.includes('phân tán')) sendMode(15);
+      else if(text.includes('cảnh sát')) sendMode(12);
+      else if(text.includes('radar') || text.includes('quét')) sendMode(13);
+      else if(text.includes('sáng dồn')) sendMode(9);
+      else if(text.includes('thở') || text.includes('mờ')) sendMode(10);
+      else if(text.includes('lóa') || text.includes('bar')) sendMode(11);
+      else if(text.includes('chớp')) sendMode(2);
+      else if(text.includes('đuổi') || text.includes('chạy')) sendMode(3);
+      else if(text.includes('xen')) sendMode(4);
+      else if(text.includes('ngẫu nhiên') || text.includes('random')) sendMode(5);
+      else if(text.includes('qua lại')) sendMode(6);
+      else if(text.includes('tim')) sendMode(7);
+      else if(text.includes('tắt hết') || text.trim() === 'tắt') sendMode(0);
+      else if(text.includes('sáng hết') || text.includes('bật hết') || text.trim() === 'bật' || text.trim() === 'mở' || text.trim() === 'sáng') sendMode(1);
+      else document.getElementById('status').innerText = "Chưa hiểu lệnh: " + text;
+    };
+    recognition.onerror = function() { btn.classList.remove('listening'); btn.innerText = " 🎤 BẤM ĐỂ NÓI LỆNH"; }
+  }
+}
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() { server.send(200, "text/html", webpage); }
+void handleSet() {
+  if (server.hasArg("m")) {
+    changeMode(server.arg("m").toInt());
+  }
+  server.send(200, "text/plain", "OK");
+}
+void handleSetLed() {
+  if (server.hasArg("id")) {
+    int id = server.arg("id").toInt();
+    if (id >= 0 && id <= 7) {
+      displayState = 0; resetLEDs(); currentMode = 8;
+      if(server.hasArg("val")) manualState[id] = server.arg("val").toInt();
+      else manualState[id] = !manualState[id];
+      updateOLED(); server.send(200, "text/plain", manualState[id] ? "1" : "0");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Loi");
+}
+void handleSetSpeed() {
+  if (server.hasArg("v")) { int val = server.arg("v").toInt(); speedMult = 100.0 / (float)val; }
+  server.send(200, "text/plain", "OK");
+}
+void handleSetBright() {
+  if (server.hasArg("v")) {
+    int val = server.arg("v").toInt();
+    globalBrightness = map(val, 1, 100, 10, 1023);
+  }
+  server.send(200, "text/plain", "OK");
+}
+void handleBeat() {
+  beatPos = 0; 
+  server.send(200, "text/plain", "BEAT");
+}
+void handleSetDisplay() {
+  if (server.hasArg("s")) { displayState = server.arg("s").toInt(); updateOLED(); }
+  server.send(200, "text/plain", "OK");
+}
+
+void setup() {
+  for(int i=0; i<8; i++) { pinMode(ledPins[i], OUTPUT); analogWrite(ledPins[i], 0); }
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  
+  display.clearDisplay(); display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1); display.setCursor(0, 0); display.println("KET NOI WIFI..."); display.display();
+  
+  setupWiFi(); 
+  
+  while (wifiMulti.run() != WL_CONNECTED) { delay(500); }
+  
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0); display.println("DA KET NOI WIFI!");
+  display.setCursor(0, 16); 
+  display.print("IP: "); display.println(WiFi.localIP().toString());
+  display.display();
+  delay(5000); 
+  
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(12, 10); display.println("SAN SANG");
+  display.display();
+  delay(2000); 
+  
+  display.setTextSize(1);
+  configTime(7 * 3600, 0, "pool.ntp.org", "time.nist.gov");
+  
+  secured_client.setInsecure();
+  
+  display.clearDisplay(); display.setCursor(0, 0); display.println("DONG BO SERVER..."); display.display();
+  while (time(nullptr) < 100000) { delay(500); }
+  
+  fetchLocation(); updateOLED();
+  
+  server.on("/", handleRoot);
+  server.on("/set", handleSet);
+  server.on("/set_led", handleSetLed);
+  server.on("/set_speed", handleSetSpeed);
+  server.on("/set_bright", handleSetBright);
+  server.on("/beat", handleBeat);
+  server.on("/set_display", handleSetDisplay);
+  server.begin();
+
+  ledTicker.attach_ms(15, updateLEDs);
+}
+
+void loop() {
+  if (wifiMulti.run() == WL_CONNECTED) {
+      server.handleClient(); 
+      
+      if (millis() - bot_lasttime > BOT_MTBS) {
+        int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+        while (numNewMessages) {
+          handleNewMessages(numNewMessages);
+          numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+        }
+        bot_lasttime = millis();
+      }
+  }
+
+  if (displayState > 0 && millis() - lastClockUpdate > 1000) {
+    lastClockUpdate = millis(); updateOLED();
+  }
+}
